@@ -93,7 +93,11 @@ def run_sft(
 
     # Training
     if training_args.do_train:
-        train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        if training_args.use_flash_checkpointing:
+            train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        else:
+            last_ckpt_path = trainer.get_last_checkpoint()
+            train_result = trainer.train(resume_from_checkpoint=last_ckpt_path)
         trainer.save_model()
         if finetuning_args.include_effective_tokens_per_second:
             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(

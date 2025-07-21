@@ -17,12 +17,18 @@
 
 import json
 import os
+import time
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
-from transformers import Seq2SeqTrainer
+from deepspeed import DeepSpeedEngine
+from dlrover.trainer.torch.flash_checkpoint.deepspeed_engine import DeepSpeedCheckpointEngine
+from dlrover.trainer.torch.flash_checkpoint.full_ckpt_engine import FullCheckpointEngine
+from dlrover.trainer.torch.flash_checkpoint.hf_trainer import HfFlashCheckpointer
+from transformers import Seq2SeqTrainer, FlashCkptSeq2SeqTrainer, TrainingArguments, TrainerState, TrainerControl
+from transformers.integrations import INTEGRATION_TO_CALLBACK, TensorBoardCallback
 from typing_extensions import override
 
 from ...extras import logging
@@ -39,9 +45,63 @@ if TYPE_CHECKING:
 
     from ...hparams import FinetuningArguments
 
+torch_native_save = torch.save
+torch_native_load = torch.load
 
 logger = logging.get_logger(__name__)
 
+class CustomTensorBoardCallback(TensorBoardCallback):
+    def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.tb_writer:
+            cost = kwargs.get("cost", -1)
+            if cost >= 0:
+                self.tb_writer.add_scalar(f"Checkpoint/{self.mode}", cost, state.x)
+
+class HfDeepSpeedCheckpointer(HfFlashCheckpointer):
+    def __init__(
+        self,
+        engine: DeepSpeedEngine,
+        checkpoint_dir,
+        storage=None,
+        comm_backend="",
+        non_blocking=False,
+    ):
+        super().__init__(checkpoint_dir, storage)
+        self.engine = engine
+        global_shard_num = 1
+        if self.engine.zero_optimization():
+            global_shard_num = dist.get_world_size(
+                self.engine.optimizer.dp_process_group
+            )
+        zero_stage = self.engine.zero_optimization_stage()
+        non_blocking = bool(os.environ["DLROVER_HF_CHECKPOINTER_NON_BLOCKING"])
+        logger.info(f"HfDeepSpeedCheckpointer inited with non_blocking is {non_blocking}")
+        self.async_save_engine = DeepSpeedCheckpointEngine(
+            checkpoint_dir,
+            storage=self.storage,
+            global_shard_num=global_shard_num,
+            zero_stage=zero_stage,
+            comm_backend=comm_backend,
+            non_blocking=non_blocking,
+        )
+
+
+class HfDdpCheckpointer(HfFlashCheckpointer):
+    def __init__(
+        self,
+        checkpoint_dir,
+        storage=None,
+        comm_backend="",
+    ):
+        super().__init__(checkpoint_dir, storage)
+        non_blocking = bool(os.environ["DLROVER_HF_CHECKPOINTER_NON_BLOCKING"])
+        logger.info(f"HfDdpCheckpointer inited with non_blocking is {non_blocking}")
+        self.async_save_engine = FullCheckpointEngine(
+            checkpoint_dir,
+            storage=self.storage,
+            comm_backend=comm_backend,
+            non_blocking=non_blocking,
+        )
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
@@ -57,6 +117,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             kwargs["processing_class"] = kwargs.pop("tokenizer")
         else:
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
+
+        # reset INTEGRATION_TO_CALLBACK
+        INTEGRATION_TO_CALLBACK["tensorboard"] = CustomTensorBoardCallback
 
         super().__init__(**kwargs)
         if processor is not None:
@@ -77,6 +140,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
             self.add_callback(BAdamCallback)
+        self.use_flash_checkpoint = self.args.use_flash_checkpoint
+        self.non_blocking = self.args.non_blocking
+        self.save_to_dist_count = self.args.save_to_disk_count
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -163,3 +229,55 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    def _save_checkpoint(self, model, trial):
+        save_start_time = time.time()
+        if self.use_flash_checkpoint:
+            if (self.count % self.save_to_disk_count) == 0:
+                self.save_to_disk = True
+            else:
+                self.save_to_disk = False
+            self.count = (self.count + 1) % self.save_to_disk_count
+            run_dir = self._get_output_dir(trial=trial)
+            if not hasattr(self, "flash_checkpointer"):
+                if self.is_deepspeed_enabled:
+                    self.flash_checkpointer = HfDeepSpeedCheckpointer(
+                        self.model_wrapped, run_dir, non_blocking=self.non_blocking
+                    )
+                elif not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+                    self.flash_checkpointer = HfDdpCheckpointer(run_dir, non_blocking=self.non_blocking)
+                else:
+                    raise ValueError(
+                        "Flash Checkpoint only supports DeepSpeed or DDP."
+                    )
+            torch.save = self.flash_checkpointer.ckpt_agent.save
+        super()._save_checkpoint(model, trial)
+        if self.use_flash_checkpoint:
+            torch.save = torch_native_save
+            if self.save_to_disk:
+                self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
+            else:
+                self.flash_checkpointer.save_checkpoint_to_memory(self.state.global_step)
+        cost = time.time() - save_start_time
+        self.control = self.callback_handler.on_save(self.args, self.state, self.control,
+                                                     mode="save_checkpoint", cost=cost)
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        super()._save(output_dir, state_dict)
+        # do we need ???
+        # torch_native_save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+    def _get_last_checkpoint_step(self):
+        tracer_file = os.path.join(self.args.output_dir, "dlrover_latest.txt")
+        if not os.path.exists(tracer_file):
+            return 0
+        with open(tracer_file, "r") as f:
+            step = int(f.read())
+        return step
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        load_start_time = time.time()
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        cost = time.time() - load_start_time
+        self.control = self.callback_handler.on_save(self.args, self.state, self.control,
+                                                     mode="save_checkpoint", cost=cost)

@@ -73,8 +73,24 @@ class RayArguments:
                 self.ray_storage_filesystem = fs.GcsFileSystem()
 
 
+
 @dataclass
-class TrainingArguments(RayArguments, Seq2SeqTrainingArguments):
+class FlashCheckpointArguments:
+    use_flash_checkpoint: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use flash checkpoint."},
+    )
+    non_blocking: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to block."},
+    )
+    save_to_disk_count: int = field(
+        default=1,
+        metadata={"help": "save_to_disk_count."},
+    )
+
+@dataclass
+class TrainingArguments(RayArguments, Seq2SeqTrainingArguments, FlashCheckpointArguments):
     r"""Arguments pertaining to the trainer."""
 
     def __post_init__(self):
