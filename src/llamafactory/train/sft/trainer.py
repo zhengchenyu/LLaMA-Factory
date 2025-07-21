@@ -231,7 +231,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
 
     def _save_checkpoint(self, model, trial):
-        save_start_time = time.time()
+        save_start_time = time.monotonic()
         if self.use_flash_checkpoint:
             if (self.count % self.save_to_disk_count) == 0:
                 self.save_to_disk = True
@@ -258,7 +258,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
             else:
                 self.flash_checkpointer.save_checkpoint_to_memory(self.state.global_step)
-        cost = time.time() - save_start_time
+        cost = time.monotonic() - save_start_time
         self.control = self.callback_handler.on_save(self.args, self.state, self.control,
                                                      mode="save_checkpoint", cost=cost)
 
@@ -276,8 +276,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return step
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        load_start_time = time.time()
+        load_start_time = time.monotonic()
         super()._load_from_checkpoint(resume_from_checkpoint, model)
-        cost = time.time() - load_start_time
+        cost = time.monotonic() - load_start_time
         self.control = self.callback_handler.on_save(self.args, self.state, self.control,
-                                                     mode="save_checkpoint", cost=cost)
+                                                     mode="load_checkpoint", cost=cost)
