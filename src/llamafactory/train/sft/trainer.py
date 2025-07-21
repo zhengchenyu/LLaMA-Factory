@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from deepspeed import DeepSpeedEngine
 from dlrover.trainer.torch.flash_checkpoint.deepspeed_engine import DeepSpeedCheckpointEngine
 from dlrover.trainer.torch.flash_checkpoint.full_ckpt_engine import FullCheckpointEngine
@@ -74,8 +75,7 @@ class HfDeepSpeedCheckpointer(HfFlashCheckpointer):
                 self.engine.optimizer.dp_process_group
             )
         zero_stage = self.engine.zero_optimization_stage()
-        non_blocking = bool(os.environ["DLROVER_HF_CHECKPOINTER_NON_BLOCKING"])
-        logger.info(f"HfDeepSpeedCheckpointer inited with non_blocking is {non_blocking}")
+        logger.info_rank0(f"HfDeepSpeedCheckpointer inited with non_blocking is {non_blocking}")
         self.async_save_engine = DeepSpeedCheckpointEngine(
             checkpoint_dir,
             storage=self.storage,
@@ -92,10 +92,10 @@ class HfDdpCheckpointer(HfFlashCheckpointer):
         checkpoint_dir,
         storage=None,
         comm_backend="",
+        non_blocking=False,
     ):
         super().__init__(checkpoint_dir, storage)
-        non_blocking = bool(os.environ["DLROVER_HF_CHECKPOINTER_NON_BLOCKING"])
-        logger.info(f"HfDdpCheckpointer inited with non_blocking is {non_blocking}")
+        logger.info_rank0(f"HfDdpCheckpointer inited with non_blocking is {non_blocking}")
         self.async_save_engine = FullCheckpointEngine(
             checkpoint_dir,
             storage=self.storage,
@@ -142,7 +142,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.add_callback(BAdamCallback)
         self.use_flash_checkpoint = self.args.use_flash_checkpoint
         self.non_blocking = self.args.non_blocking
-        self.save_to_dist_count = self.args.save_to_disk_count
+        self.save_to_disk_count = self.args.save_to_disk_count
+        logger.info_rank0(f"zcydebug: use_flash_checkpoint is {self.use_flash_checkpoint}, "
+                          f"non_blocking is {self.non_blocking}, "
+                          f"save_to_disk_count is {self.save_to_disk_count}")
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -235,8 +238,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.use_flash_checkpoint:
             if (self.count % self.save_to_disk_count) == 0:
                 self.save_to_disk = True
+                logger.info_rank0(f"zcydebug: save_to_disk is true")
             else:
                 self.save_to_disk = False
+                logger.info_rank0(f"zcydebug: save_to_disk is false")
             self.count = (self.count + 1) % self.save_to_disk_count
             run_dir = self._get_output_dir(trial=trial)
             if not hasattr(self, "flash_checkpointer"):

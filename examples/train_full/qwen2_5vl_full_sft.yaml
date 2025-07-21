@@ -43,8 +43,9 @@ lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 180000000
+# resume_from_checkpoint: saves/qwen2_5vl-7b/full/sft/checkpoint-130
 resume_from_checkpoint: null
-use_flash_checkpoint: false
+use_flash_checkpoint: true
 non_blocking: false
 save_to_disk_count: 2
 
