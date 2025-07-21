@@ -28,7 +28,7 @@ from deepspeed import DeepSpeedEngine
 from dlrover.trainer.torch.flash_checkpoint.deepspeed_engine import DeepSpeedCheckpointEngine
 from dlrover.trainer.torch.flash_checkpoint.full_ckpt_engine import FullCheckpointEngine
 from dlrover.trainer.torch.flash_checkpoint.hf_trainer import HfFlashCheckpointer
-from transformers import Seq2SeqTrainer, FlashCkptSeq2SeqTrainer, TrainingArguments, TrainerState, TrainerControl
+from transformers import Seq2SeqTrainer, TrainingArguments, TrainerState, TrainerControl
 from transformers.integrations import INTEGRATION_TO_CALLBACK, TensorBoardCallback
 from typing_extensions import override
 
