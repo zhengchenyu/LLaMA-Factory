@@ -48,6 +48,7 @@ resume_from_checkpoint: null
 use_flash_checkpoint: true
 non_blocking: false
 save_to_disk_count: 2
+save_safetensors: false
 
 ### eval
 # val_size: 0.1

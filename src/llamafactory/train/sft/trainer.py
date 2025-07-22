@@ -25,9 +25,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from deepspeed import DeepSpeedEngine
+from dlrover.python.common.storage import PosixDiskStorage
+from dlrover.trainer.torch.flash_checkpoint.deepspeed import AsyncCheckpointAgent
 from dlrover.trainer.torch.flash_checkpoint.deepspeed_engine import DeepSpeedCheckpointEngine
+from dlrover.trainer.torch.flash_checkpoint.engine import CheckpointEngine
 from dlrover.trainer.torch.flash_checkpoint.full_ckpt_engine import FullCheckpointEngine
-from dlrover.trainer.torch.flash_checkpoint.hf_trainer import HfFlashCheckpointer
 from transformers import Seq2SeqTrainer, TrainingArguments, TrainerState, TrainerControl
 from transformers.integrations import INTEGRATION_TO_CALLBACK, TensorBoardCallback
 from typing_extensions import override
@@ -55,8 +57,35 @@ class CustomTensorBoardCallback(TensorBoardCallback):
     def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         if self.tb_writer:
             cost = kwargs.get("cost", -1)
-            if cost >= 0:
+            if cost > -1:
                 self.tb_writer.add_scalar(f"Checkpoint/{self.mode}", cost, state.x)
+
+
+class HfFlashCheckpointer(object):
+    def __init__(self, checkpoint_dir, storage=None):
+        self.checkpoint_dir = checkpoint_dir
+        self.storage = PosixDiskStorage() if not storage else storage
+        self.ckpt_agent = AsyncCheckpointAgent(self.storage)
+        self.async_save_engine: Optional[CheckpointEngine] = None
+
+    def save_checkpoint_to_memory(self, step):
+        success = self.async_save_engine.save_to_memory(
+            step,
+            self.ckpt_agent.state_dict,
+            self.ckpt_agent.paths,
+        )
+        return success
+
+    def save_checkpoint_to_storage(self, step):
+        success = self.async_save_engine.save_to_storage(
+            step,
+            self.ckpt_agent.state_dict,
+            self.ckpt_agent.paths,
+        )
+        return success
+
+    def wait_for_copying(self):
+        self.async_save_engine.wait_for_copying()
 
 class HfDeepSpeedCheckpointer(HfFlashCheckpointer):
     def __init__(
@@ -120,6 +149,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # reset INTEGRATION_TO_CALLBACK
         INTEGRATION_TO_CALLBACK["tensorboard"] = CustomTensorBoardCallback
+        self.save_counter_for_disk = 0
 
         super().__init__(**kwargs)
         if processor is not None:
@@ -233,16 +263,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
 
+    def on_pre_optimizer_step(self, args: TrainingArguments, state: TrainerState, control: TrainerControl):
+        if self.use_flash_checkpoint and self.non_blocking and hasattr(self, "flash_checkpointer"):
+            self.flash_checkpointer.wait_for_copying()
+
     def _save_checkpoint(self, model, trial):
         save_start_time = time.monotonic()
         if self.use_flash_checkpoint:
-            if (self.count % self.save_to_disk_count) == 0:
+            self.save_counter_for_disk = (self.save_counter_for_disk + 1) % self.save_to_disk_count
+            if (self.save_counter_for_disk % self.save_to_disk_count) == 0:
                 self.save_to_disk = True
                 logger.info_rank0(f"zcydebug: save_to_disk is true")
             else:
                 self.save_to_disk = False
                 logger.info_rank0(f"zcydebug: save_to_disk is false")
-            self.count = (self.count + 1) % self.save_to_disk_count
             run_dir = self._get_output_dir(trial=trial)
             if not hasattr(self, "flash_checkpointer"):
                 if self.is_deepspeed_enabled:
@@ -260,12 +294,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.use_flash_checkpoint:
             torch.save = torch_native_save
             if self.save_to_disk:
+                logger.info_rank0(f"zcydebug: save to storage")
                 self.flash_checkpointer.save_checkpoint_to_storage(self.state.global_step)
             else:
+                logger.info_rank0(f"zcydebug: save to memory")
                 self.flash_checkpointer.save_checkpoint_to_memory(self.state.global_step)
-        cost = time.monotonic() - save_start_time
-        self.control = self.callback_handler.on_save(self.args, self.state, self.control,
-                                                     mode="save_checkpoint", cost=cost)
+        self.state.mode = "save_checkpoint"
+        self.state.cost = time.monotonic() - save_start_time
+        self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         super()._save(output_dir, state_dict)
@@ -283,6 +319,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         load_start_time = time.monotonic()
         super()._load_from_checkpoint(resume_from_checkpoint, model)
-        cost = time.monotonic() - load_start_time
-        self.control = self.callback_handler.on_save(self.args, self.state, self.control,
-                                                     mode="load_checkpoint", cost=cost)
+        self.state.mode = "load_checkpoint"
+        self.state.cost = time.monotonic() - load_start_time
+        self.control = self.callback_handler.on_save(self.args, self.state, self.control)

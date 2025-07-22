@@ -93,7 +93,7 @@ def run_sft(
 
     # Training
     if training_args.do_train:
-        if training_args.use_flash_checkpointing:
+        if training_args.use_flash_checkpoint:
             train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         else:
             last_ckpt_path = trainer.get_last_checkpoint()
